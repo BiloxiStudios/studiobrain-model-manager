@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "studiobrain-model-manager"
+version = "0.1.0"
+description = "Open-core GPU inference orchestrator with smart VRAM management. Multi-model, tier-based loading, OpenAI-compatible API."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Biloxi Studios", email = "dev@biloxistudios.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+    "torch>=2.0",
+    "transformers>=4.36",
+    "sentence-transformers>=2.2",
+    "Pillow>=10.0",
+    "nvidia-ml-py>=12.0",
+    "pyyaml>=6.0",
+    "numpy>=1.24",
+    "psutil>=5.9",
+    "python-multipart>=0.0.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "httpx>=0.24",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+model-manager = "studiobrain_model_manager.server:main"
+
+[project.urls]
+Homepage = "https://github.com/BiloxiStudios/studiobrain-model-manager"
+Repository = "https://github.com/BiloxiStudios/studiobrain-model-manager"
+Issues = "https://github.com/BiloxiStudios/studiobrain-model-manager/issues"
+
+[tool.setuptools.packages.find]
+include = ["studiobrain_model_manager*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"

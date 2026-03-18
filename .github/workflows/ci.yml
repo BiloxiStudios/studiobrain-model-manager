@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check studiobrain_model_manager/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: python -c "from studiobrain_model_manager.config import load_config; load_config()"
+      - run: python -c "from studiobrain_model_manager.server import app; print('Server module OK')"
+      - run: python -c "from studiobrain_model_manager.model_manager import ModelManager; print('ModelManager OK')"
+      - run: python -c "from studiobrain_model_manager.registry import ModelRegistry; print('Registry OK')"
+      - run: python -c "from studiobrain_model_manager.vram_monitor import VRAMMonitor; print('VRAMMonitor OK')"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t studiobrain-model-manager:test .

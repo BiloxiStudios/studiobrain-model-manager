@@ -1,0 +1,52 @@
+# StudioBrain Model Manager — Example Configuration
+# Copy to models.yaml and adjust for your environment.
+
+server:
+  host: "0.0.0.0"
+  port: 7070
+
+# VRAM management
+vram:
+  # Explicit budget for this process (GB). Set this in shared-GPU environments
+  # where other containers (vLLM, ComfyUI, etc.) consume VRAM alongside this service.
+  # 0 = auto-detect from physical GPU total.
+  budget_gb: 0
+
+  # Max VRAM this service is allowed to use (GB). Ignored when budget_gb > 0.
+  max_usage_gb: 24.0
+
+  # Per-tier VRAM limits (GB)
+  tier_1_limit_gb: 4.0    # Always-loaded (RAM, BLIP-2) — lightweight
+  tier_2_limit_gb: 8.0    # On-demand (Florence-2, SD) — moderate
+  tier_3_limit_gb: 16.0   # Exclusive (Qwen, large LLMs) — heavy, one at a time
+
+# Model loading behaviour
+loading:
+  preload_at_startup: true
+  always_loaded:
+    - ram
+    - blip2
+  tier1_always_loaded: true
+  cache_timeout_seconds: 300
+  auto_unload_timeout_seconds: 300
+
+# Embedding model
+embedding:
+  model: "all-MiniLM-L6-v2"
+  dimension: 384
+  max_batch_size: 64
+
+# Model cache directory (where HuggingFace models are stored)
+cache_dir: "~/.cache/studiobrain-models"
+
+# Per-model overrides (optional)
+# models:
+#   florence2:
+#     model_id: "microsoft/Florence-2-large"
+#     device: "cuda:0"
+#     dtype: "float16"
+#   ram:
+#     model_id: "google/vit-base-patch16-224"
+#   whisper:
+#     model_id: "openai/whisper-large-v3"
+#     device: "cuda:0"
