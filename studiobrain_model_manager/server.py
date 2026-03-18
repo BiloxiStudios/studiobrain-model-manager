@@ -16,11 +16,13 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image as PILImage
 from pydantic import BaseModel, Field
 
 from studiobrain_model_manager.config import Settings, load_config
+from studiobrain_model_manager.litellm_registration import register_with_litellm, deregister_from_litellm
 from studiobrain_model_manager.model_manager import ModelManager
 from studiobrain_model_manager.registry import ModelRegistry
 from studiobrain_model_manager.vram_monitor import VRAMMonitor
@@ -60,9 +62,14 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting Model Manager on {_settings.host}:{_settings.port}")
     await _model_manager.initialize()
 
+    # Register models with LiteLLM proxy (non-blocking, retries in background)
+    await register_with_litellm(_model_registry, _settings.port)
+
     yield
 
     logger.info("Shutting down Model Manager...")
+    # Deregister models from LiteLLM proxy (best-effort)
+    await deregister_from_litellm(_model_registry, _settings.port)
     await _model_manager.cleanup()
     await _model_registry.cleanup()
 
@@ -155,9 +162,10 @@ class EmbeddingResponse(BaseModel):
 
 
 class ImageProcessRequest(BaseModel):
-    file_path: Optional[str] = None
-    image_base64: Optional[str] = None
-    processors: List[str] = Field(default_factory=lambda: ["ram", "florence2"])
+    """Request body for /v1/process/image (JSON mode)."""
+    file_path: Optional[str] = None        # local filesystem path
+    image_base64: Optional[str] = None     # base64-encoded image bytes
+    processors: Optional[str] = "all"      # "ram", "florence", "all"
     options: Dict[str, Any] = Field(default_factory=dict)
 
 
