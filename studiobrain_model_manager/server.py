@@ -6,8 +6,12 @@ for VRAM monitoring, model loading/unloading, and health checks.
 """
 
 import argparse
+import base64
 import logging
+import os
+import tempfile
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -31,6 +35,11 @@ _model_manager: Optional[ModelManager] = None
 _model_registry: Optional[ModelRegistry] = None
 _vram_monitor: Optional[VRAMMonitor] = None
 _start_time: float = 0.0
+
+
+def _gen_id(prefix: str = "cmpl") -> str:
+    """Generate a unique OpenAI-style response ID."""
+    return f"{prefix}-{uuid.uuid4().hex[:24]}"
 
 
 # ---------------------------------------------------------------------------
@@ -99,11 +108,31 @@ class CompletionChoice(BaseModel):
 
 
 class CompletionResponse(BaseModel):
-    id: str = "cmpl-model-manager"
+    id: str = Field(default_factory=lambda: _gen_id("cmpl"))
     object: str = "text_completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str = "default"
     choices: List[CompletionChoice] = []
+    usage: Dict[str, int] = Field(default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+
+
+class ChatCompletionMessage(BaseModel):
+    role: str = "assistant"
+    content: str = ""
+
+
+class ChatCompletionChoice(BaseModel):
+    index: int = 0
+    message: ChatCompletionMessage = Field(default_factory=ChatCompletionMessage)
+    finish_reason: str = "stop"
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str = Field(default_factory=lambda: _gen_id("chatcmpl"))
+    object: str = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str = "default"
+    choices: List[ChatCompletionChoice] = []
     usage: Dict[str, int] = Field(default_factory=lambda: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
 
 
@@ -126,13 +155,49 @@ class EmbeddingResponse(BaseModel):
 
 
 class ImageProcessRequest(BaseModel):
-    file_path: str
+    file_path: Optional[str] = None
+    image_base64: Optional[str] = None
     processors: List[str] = Field(default_factory=lambda: ["ram", "florence2"])
     options: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ModelLoadRequest(BaseModel):
     force: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token count estimate (1 token ~ 4 chars)."""
+    return max(1, len(text) // 4)
+
+
+async def _run_text_generation(model_name: str, prompt: str, max_tokens: int, temperature: float) -> str:
+    """Load the requested model and run text generation, returning the output text."""
+    processor = await _model_manager.get_or_load_model(model_name, model_type="text")
+    if not processor:
+        raise HTTPException(503, f"Model '{model_name}' could not be loaded")
+
+    result = await processor.process(prompt, options={
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    })
+    # Processors may return text in different keys depending on implementation
+    text = result.get("text", "")
+    if not text:
+        text = result.get("descriptions", {}).get("short", "")
+    if not text:
+        text = result.get("output", "")
+    return text
+
+
+def _resolve_model_name(model: str) -> str:
+    """Map an OpenAI-style model name to an internal model name."""
+    if model in ("default", ""):
+        return "qwen_text"
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -150,21 +215,75 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# OpenAI-compatible: /v1/completions
+# OpenAI-compatible: /v1/chat/completions
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+async def create_chat_completion(req: CompletionRequest):
+    """
+    OpenAI-compatible chat completion endpoint.
+    LiteLLM routes here when configured as a custom provider.
+    """
+    if not _model_manager:
+        raise HTTPException(503, "Model manager not initialized")
+
+    model_name = _resolve_model_name(req.model)
+
+    # Build the prompt from messages
+    prompt = req.prompt or ""
+    if req.messages:
+        parts = []
+        for m in req.messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            # Handle content that may be a list (vision messages with text + image_url)
+            if isinstance(content, list):
+                text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                content = "\n".join(text_parts)
+            parts.append(f"{role}: {content}")
+        prompt = "\n".join(parts)
+
+    if not prompt:
+        raise HTTPException(400, "Either 'prompt' or 'messages' must be provided")
+
+    try:
+        text = await _run_text_generation(model_name, prompt, req.max_tokens, req.temperature)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Chat completion error: {e}", exc_info=True)
+        raise HTTPException(500, str(e))
+
+    prompt_tokens = _estimate_tokens(prompt)
+    completion_tokens = _estimate_tokens(text)
+
+    return ChatCompletionResponse(
+        model=model_name,
+        choices=[
+            ChatCompletionChoice(
+                message=ChatCompletionMessage(role="assistant", content=text),
+                finish_reason="stop",
+            )
+        ],
+        usage={
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible: /v1/completions (legacy text completion)
 # ---------------------------------------------------------------------------
 
 @app.post("/v1/completions", response_model=CompletionResponse)
 async def create_completion(req: CompletionRequest):
-    """OpenAI-compatible completion endpoint. Routes to the appropriate text/vision processor."""
+    """OpenAI-compatible text completion endpoint."""
     if not _model_manager:
         raise HTTPException(503, "Model manager not initialized")
 
-    # Determine which model to use
-    model_name = req.model if req.model != "default" else "qwen_text"
-
-    processor = await _model_manager.get_or_load_model(model_name, model_type="text")
-    if not processor:
-        raise HTTPException(503, f"Model '{model_name}' could not be loaded")
+    model_name = _resolve_model_name(req.model)
 
     # Build the prompt
     prompt = req.prompt or ""
@@ -173,19 +292,28 @@ async def create_completion(req: CompletionRequest):
             f"{m.get('role', 'user')}: {m.get('content', '')}" for m in req.messages
         )
 
+    if not prompt:
+        raise HTTPException(400, "Either 'prompt' or 'messages' must be provided")
+
     try:
-        result = await processor.process(prompt, options={
-            "max_tokens": req.max_tokens,
-            "temperature": req.temperature,
-        })
-        text = result.get("text", result.get("descriptions", {}).get("short", ""))
+        text = await _run_text_generation(model_name, prompt, req.max_tokens, req.temperature)
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Completion error: {e}")
+        logger.error(f"Completion error: {e}", exc_info=True)
         raise HTTPException(500, str(e))
+
+    prompt_tokens = _estimate_tokens(prompt)
+    completion_tokens = _estimate_tokens(text)
 
     return CompletionResponse(
         model=model_name,
         choices=[CompletionChoice(text=text, finish_reason="stop")],
+        usage={
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
     )
 
 
@@ -203,28 +331,49 @@ async def create_embeddings(req: EmbeddingRequest):
     if not processor:
         raise HTTPException(503, "Embedding model could not be loaded")
 
+    # Ensure the embedding model is actually loaded (EmbeddingService uses load() not load_model())
+    if hasattr(processor, "is_loaded") and not processor.is_loaded():
+        if hasattr(processor, "load"):
+            loaded = await processor.load()
+            if not loaded:
+                raise HTTPException(503, "Failed to initialize embedding model")
+
     texts = req.input if isinstance(req.input, list) else [req.input]
 
+    if not texts:
+        raise HTTPException(400, "Input must be a non-empty string or list of strings")
+
     try:
+        import numpy as np
+
         if hasattr(processor, "embed_batch"):
             embeddings = await processor.embed_batch(texts)
         else:
-            import numpy as np
             embeddings = []
             for t in texts:
                 emb = await processor.embed_text(t)
                 embeddings.append(emb)
             embeddings = np.array(embeddings)
 
+        if embeddings is None:
+            raise HTTPException(500, "Embedding generation returned None")
+
         data = [
             EmbeddingData(embedding=emb.tolist(), index=i)
             for i, emb in enumerate(embeddings)
         ]
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Embedding error: {e}")
+        logger.error(f"Embedding error: {e}", exc_info=True)
         raise HTTPException(500, str(e))
 
-    return EmbeddingResponse(data=data, model=req.model)
+    total_tokens = sum(_estimate_tokens(t) for t in texts)
+    return EmbeddingResponse(
+        data=data,
+        model=req.model,
+        usage={"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +394,6 @@ async def create_transcription(
     if not processor:
         raise HTTPException(503, "Whisper model could not be loaded")
 
-    import tempfile, os
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename or ".wav")[1])
     try:
         tmp.write(await file.read())
@@ -257,31 +405,102 @@ async def create_transcription(
 
 
 # ---------------------------------------------------------------------------
-# Custom: /v1/process/image
+# Custom: /v1/process/image  (JSON body with file_path or base64)
 # ---------------------------------------------------------------------------
 
 @app.post("/v1/process/image")
 async def process_image(req: ImageProcessRequest):
     """
     Custom image processing endpoint.
+    Accepts either a local file_path or base64-encoded image data.
     Runs one or more processors (ram, florence2, blip2) and returns structured JSON.
     """
     if not _model_manager:
         raise HTTPException(503, "Model manager not initialized")
 
-    results = {}
-    for proc_name in req.processors:
-        processor = await _model_manager.get_or_load_model(proc_name, model_type="image")
-        if processor:
-            try:
-                result = await processor.process(req.file_path, req.options)
-                results[proc_name] = result
-            except Exception as e:
-                results[proc_name] = {"success": False, "error": str(e)}
-        else:
-            results[proc_name] = {"success": False, "error": f"Could not load {proc_name}"}
+    # Resolve image to a file path
+    tmp_path: Optional[str] = None
+    file_path = req.file_path
 
-    return results
+    if req.image_base64 and not file_path:
+        # Decode base64 to a temp file
+        try:
+            image_data = base64.b64decode(req.image_base64)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            tmp.write(image_data)
+            tmp.close()
+            file_path = tmp.name
+            tmp_path = tmp.name
+        except Exception as e:
+            raise HTTPException(400, f"Invalid base64 image data: {e}")
+
+    if not file_path:
+        raise HTTPException(400, "Either 'file_path' or 'image_base64' must be provided")
+
+    try:
+        results = {}
+        for proc_name in req.processors:
+            processor = await _model_manager.get_or_load_model(proc_name, model_type="image")
+            if processor:
+                try:
+                    result = await processor.process(file_path, req.options)
+                    results[proc_name] = result
+                except Exception as e:
+                    logger.error(f"Image processor '{proc_name}' error: {e}", exc_info=True)
+                    results[proc_name] = {"success": False, "error": str(e)}
+            else:
+                results[proc_name] = {"success": False, "error": f"Could not load {proc_name}"}
+        return results
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Custom: /v1/process/image/upload  (multipart file upload)
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/process/image/upload")
+async def process_image_upload(
+    file: UploadFile = File(...),
+    processors: str = Form("ram,florence2"),
+):
+    """
+    Image processing via file upload.
+    Accepts a multipart image file and comma-separated processor names.
+    """
+    if not _model_manager:
+        raise HTTPException(503, "Model manager not initialized")
+
+    suffix = os.path.splitext(file.filename or ".png")[1]
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    try:
+        tmp.write(await file.read())
+        tmp.close()
+
+        proc_names = [p.strip() for p in processors.split(",") if p.strip()]
+        results = {}
+        for proc_name in proc_names:
+            processor = await _model_manager.get_or_load_model(proc_name, model_type="image")
+            if processor:
+                try:
+                    result = await processor.process(tmp.name)
+                    results[proc_name] = result
+                except Exception as e:
+                    logger.error(f"Image processor '{proc_name}' error: {e}", exc_info=True)
+                    results[proc_name] = {"success": False, "error": str(e)}
+            else:
+                results[proc_name] = {"success": False, "error": f"Could not load {proc_name}"}
+
+        return results
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -298,12 +517,15 @@ async def list_models():
     models = []
     for model_type, model_dict in info.items():
         for model_name, model_data in model_dict.items():
+            loaded = model_data.get("loaded", False)
+            # Include created timestamp for OpenAI compatibility
             models.append({
                 "id": model_name,
                 "object": "model",
+                "created": int(_start_time),
                 "owned_by": "studiobrain",
                 "type": model_type,
-                "loaded": model_data.get("loaded", False),
+                "loaded": loaded,
                 "capabilities": model_data.get("capabilities", []),
                 "size": model_data.get("size", "unknown"),
             })
@@ -329,8 +551,8 @@ async def load_model(name: str, req: ModelLoadRequest = ModelLoadRequest()):
     if not _model_manager:
         raise HTTPException(503, "Model manager not initialized")
 
-    success = await _model_manager.get_or_load_model(name)
-    if success:
+    processor = await _model_manager.get_or_load_model(name)
+    if processor:
         return {"status": "loaded", "model": name}
     raise HTTPException(500, f"Failed to load model: {name}")
 

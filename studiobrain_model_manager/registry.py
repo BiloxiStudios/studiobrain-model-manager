@@ -198,8 +198,14 @@ class ModelRegistry:
             
             if processor:
                 # Load the actual model into the processor
+                # Processors use load_model() (BaseProcessor subclasses) or load() (EmbeddingService)
                 if hasattr(processor, 'load_model'):
                     load_success = await processor.load_model()
+                    if not load_success:
+                        logger.error(f"Failed to load model for {model_type}/{model_name}")
+                        return False
+                elif hasattr(processor, 'load'):
+                    load_success = await processor.load()
                     if not load_success:
                         logger.error(f"Failed to load model for {model_type}/{model_name}")
                         return False
@@ -278,8 +284,18 @@ class ModelRegistry:
             return None
     
     async def unload_model(self, model_type: str, model_name: str) -> bool:
-        """Unload a model from memory"""
+        """Unload a model from memory. Pass model_type='auto' to search all types."""
         try:
+            # Auto-detect model_type by searching all registered types
+            if model_type == "auto":
+                for mt in list(self.models.keys()):
+                    if model_name in self.models.get(mt, {}):
+                        model_type = mt
+                        break
+                else:
+                    logger.warning(f"Model {model_name} not found in any type (auto-detect)")
+                    return False
+
             if model_type in self.models and model_name in self.models[model_type]:
                 logger.info(f"Unloading model: {model_type}/{model_name}")
                 
