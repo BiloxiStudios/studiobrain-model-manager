@@ -413,25 +413,188 @@ async def create_transcription(
 
 
 # ---------------------------------------------------------------------------
+# Helpers for /v1/process/image
+# ---------------------------------------------------------------------------
+
+# Alias map so callers can use short names
+_PROCESSOR_ALIASES: Dict[str, str] = {
+    "ram": "ram",
+    "florence": "florence2",
+    "florence2": "florence2",
+}
+_ALL_IMAGE_PROCESSORS = ["ram", "florence2"]
+
+
+def _resolve_processors(raw: str) -> List[str]:
+    """
+    Resolve a processors selector string into a list of internal model names.
+
+    Accepted values:
+      - ``"all"``      -> ["ram", "florence2"]
+      - ``"ram"``      -> ["ram"]
+      - ``"florence"``  -> ["florence2"]
+      - comma-separated combination: ``"ram,florence"`` -> ["ram", "florence2"]
+    """
+    raw = (raw or "all").strip().lower()
+    if raw == "all":
+        return list(_ALL_IMAGE_PROCESSORS)
+
+    names: List[str] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        resolved = _PROCESSOR_ALIASES.get(token)
+        if resolved is None:
+            raise HTTPException(
+                400,
+                f"Unknown image processor '{token}'. "
+                f"Valid values: {', '.join(sorted(_PROCESSOR_ALIASES.keys()))}, all",
+            )
+        if resolved not in names:
+            names.append(resolved)
+    return names or list(_ALL_IMAGE_PROCESSORS)
+
+
+def _get_image_metadata(file_path: str) -> Dict[str, Any]:
+    """Open *file_path* with PIL and return basic image metadata."""
+    try:
+        with PILImage.open(file_path) as img:
+            return {
+                "width": img.width,
+                "height": img.height,
+                "format": (img.format or "").upper() or None,
+                "mode": img.mode,
+            }
+    except Exception as exc:
+        logger.warning(f"Could not read image metadata from {file_path}: {exc}")
+        return {}
+
+
+def _merge_processor_results(
+    per_processor: Dict[str, Dict[str, Any]],
+    image_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Merge the raw results returned by individual processors into the unified
+    response schema::
+
+        {
+          "tags": [{"name": "...", "confidence": 0.95, "category": "object"}],
+          "descriptions": {"short": "...", "detailed": "..."},
+          "metadata": {"width": 1024, "height": 768},
+          "features": {"extracted_text": "..."},
+          "processors_used": ["ram", "florence2"],
+          "errors": { ... }          # only present when a processor failed
+        }
+    """
+    merged_tags: Dict[str, Dict[str, Any]] = {}   # keyed by lowercase name for dedup
+    merged_descriptions: Dict[str, str] = {}
+    merged_features: Dict[str, Any] = {}
+    processors_used: List[str] = []
+    errors: Dict[str, str] = {}
+
+    for proc_name, result in per_processor.items():
+        if not result.get("success", False):
+            errors[proc_name] = result.get("error", "unknown error")
+            continue
+
+        processors_used.append(proc_name)
+
+        # --- tags ---
+        for tag in result.get("tags", []):
+            key = tag["name"].lower()
+            existing = merged_tags.get(key)
+            if existing is None or tag.get("confidence", 0) > existing.get("confidence", 0):
+                merged_tags[key] = tag
+
+        # --- descriptions ---
+        for desc_key, desc_val in result.get("descriptions", {}).items():
+            if desc_val:
+                merged_descriptions[desc_key] = desc_val
+
+        # --- features ---
+        for feat_key, feat_val in result.get("features", {}).items():
+            if feat_val is not None:
+                merged_features[feat_key] = feat_val
+
+        # --- metadata (processor-level, used as fallback) ---
+        proc_meta = result.get("metadata", {})
+        if proc_meta and not image_metadata:
+            image_metadata = proc_meta
+
+    # Sort tags by confidence descending
+    sorted_tags = sorted(merged_tags.values(), key=lambda t: t.get("confidence", 0), reverse=True)
+
+    response: Dict[str, Any] = {
+        "tags": sorted_tags,
+        "descriptions": merged_descriptions,
+        "metadata": image_metadata,
+        "features": merged_features,
+        "processors_used": processors_used,
+    }
+    if errors:
+        response["errors"] = errors
+    return response
+
+
+async def _run_processors(
+    file_path: str,
+    proc_names: List[str],
+    options: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Run the requested image processors on *file_path* and return the unified
+    merged response.
+    """
+    if not _model_manager:
+        raise HTTPException(503, "Model manager not initialized")
+
+    image_metadata = _get_image_metadata(file_path)
+
+    per_processor: Dict[str, Dict[str, Any]] = {}
+    for proc_name in proc_names:
+        processor = await _model_manager.get_or_load_model(proc_name, model_type="image")
+        if processor:
+            try:
+                result = await processor.process(file_path, options)
+                per_processor[proc_name] = result
+            except Exception as e:
+                logger.error(f"Image processor '{proc_name}' error: {e}", exc_info=True)
+                per_processor[proc_name] = {"success": False, "error": str(e)}
+        else:
+            per_processor[proc_name] = {"success": False, "error": f"Could not load {proc_name}"}
+
+    return _merge_processor_results(per_processor, image_metadata)
+
+
+# ---------------------------------------------------------------------------
 # Custom: /v1/process/image  (JSON body with file_path or base64)
 # ---------------------------------------------------------------------------
 
 @app.post("/v1/process/image")
 async def process_image(req: ImageProcessRequest):
     """
-    Custom image processing endpoint.
-    Accepts either a local file_path or base64-encoded image data.
-    Runs one or more processors (ram, florence2, blip2) and returns structured JSON.
+    Unified image processing endpoint (JSON body).
+
+    Accepts either a local ``file_path`` or ``image_base64``.  The
+    ``processors`` field selects which models to run: ``"ram"``,
+    ``"florence"`` (alias for florence2), ``"all"`` (default), or a
+    comma-separated combination.
+
+    Returns a merged result with tags, descriptions, metadata, features,
+    and which processors were used.
     """
     if not _model_manager:
         raise HTTPException(503, "Model manager not initialized")
+
+    proc_names = _resolve_processors(req.processors)
 
     # Resolve image to a file path
     tmp_path: Optional[str] = None
     file_path = req.file_path
 
     if req.image_base64 and not file_path:
-        # Decode base64 to a temp file
         try:
             image_data = base64.b64decode(req.image_base64)
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
@@ -446,19 +609,7 @@ async def process_image(req: ImageProcessRequest):
         raise HTTPException(400, "Either 'file_path' or 'image_base64' must be provided")
 
     try:
-        results = {}
-        for proc_name in req.processors:
-            processor = await _model_manager.get_or_load_model(proc_name, model_type="image")
-            if processor:
-                try:
-                    result = await processor.process(file_path, req.options)
-                    results[proc_name] = result
-                except Exception as e:
-                    logger.error(f"Image processor '{proc_name}' error: {e}", exc_info=True)
-                    results[proc_name] = {"success": False, "error": str(e)}
-            else:
-                results[proc_name] = {"success": False, "error": f"Could not load {proc_name}"}
-        return results
+        return await _run_processors(file_path, proc_names, req.options)
     finally:
         if tmp_path:
             try:
@@ -474,36 +625,34 @@ async def process_image(req: ImageProcessRequest):
 @app.post("/v1/process/image/upload")
 async def process_image_upload(
     file: UploadFile = File(...),
-    processors: str = Form("ram,florence2"),
+    processors: str = Query("all", description='Processor selection: "ram", "florence", "all"'),
+    options: str = Query("{}", description="JSON-encoded processing options"),
 ):
     """
-    Image processing via file upload.
-    Accepts a multipart image file and comma-separated processor names.
+    Image processing via file upload (multipart).
+
+    ``processors`` accepts ``"ram"``, ``"florence"``, ``"all"`` (default),
+    or a comma-separated combination.  Returns the same unified JSON
+    structure as the JSON endpoint.
     """
     if not _model_manager:
         raise HTTPException(503, "Model manager not initialized")
+
+    proc_names = _resolve_processors(processors)
+
+    # Parse options JSON
+    import json as _json
+    try:
+        opts = _json.loads(options) if options else {}
+    except _json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON in 'options' query parameter")
 
     suffix = os.path.splitext(file.filename or ".png")[1]
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         tmp.write(await file.read())
         tmp.close()
-
-        proc_names = [p.strip() for p in processors.split(",") if p.strip()]
-        results = {}
-        for proc_name in proc_names:
-            processor = await _model_manager.get_or_load_model(proc_name, model_type="image")
-            if processor:
-                try:
-                    result = await processor.process(tmp.name)
-                    results[proc_name] = result
-                except Exception as e:
-                    logger.error(f"Image processor '{proc_name}' error: {e}", exc_info=True)
-                    results[proc_name] = {"success": False, "error": str(e)}
-            else:
-                results[proc_name] = {"success": False, "error": f"Could not load {proc_name}"}
-
-        return results
+        return await _run_processors(tmp.name, proc_names, opts)
     finally:
         try:
             os.unlink(tmp.name)
